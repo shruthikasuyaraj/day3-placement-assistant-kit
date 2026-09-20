@@ -108,10 +108,18 @@ class RunStore:
     # ================================================================== Part 1: the queue (TODO)
 
     def enqueue(self, thread_id: str, text: str, model: str, max_attempts: int = 3) -> str:
-        """TODO (Part 1.1): in ONE transaction, save the user's message (self.append_message) and insert a
-        run: new uuid4 id, status 'queued', this model, max_attempts, available_at = self.clock().
-        Return the run id. If either insert fails, neither may remain."""
-        raise NotImplementedError
+        run_id = str(uuid.uuid4())
+        now = self.clock()
+
+        with self.transaction() as c:
+            self.append_message(thread_id, "user", text)
+            c.execute(
+                "INSERT INTO run (id, thread_id, status, model, max_attempts, available_at)"
+                " VALUES (?, ?, 'queued', ?, ?, ?)",
+                (run_id, thread_id, model, max_attempts, now)
+            )
+
+        return run_id
 
     def claim_next(self, worker_id: str, lease_seconds: float) -> Claimed | None:
         """TODO (Part 1.2): atomically take the oldest claimable run (status 'queued', available_at <= now,
