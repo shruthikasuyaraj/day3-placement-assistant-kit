@@ -1,0 +1,4 @@
+[36mworker test-w[0m [2mon mock, lease 30 s. Ctrl+C to stop.[0m
+  [2m 1 model asks for check_eligibility[0m
+[31mrun 39aacff2 failed[0m
+

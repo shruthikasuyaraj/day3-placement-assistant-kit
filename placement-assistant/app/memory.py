@@ -62,8 +62,9 @@ class RunStore:
         return self.conn.execute("SELECT seq FROM message WHERE id = ?", (cur.lastrowid,)).fetchone()["seq"]
 
     def load_history(self, thread_id: str) -> list[dict]:
-        rows = self.conn.execute("SELECT seq, role, text FROM message WHERE thread_id = ? ORDER BY seq",
-                                 (thread_id,)).fetchall()
+        rows = self.conn.execute(
+            "SELECT seq, role, text FROM message WHERE thread_id = ? ORDER BY seq",
+            (thread_id,)).fetchall()
         return [dict(r) for r in rows]
 
     def record_model_step(self, run_id: str, seq: int, tokens_in: int, tokens_out: int,
@@ -73,18 +74,22 @@ class RunStore:
                 "INSERT INTO run_step (run_id, seq, kind, tokens_in, tokens_out, text, tool_calls)"
                 " VALUES (?, ?, 'model', ?, ?, ?, ?)",
                 (run_id, seq, tokens_in, tokens_out, text, json.dumps(tool_calls))).lastrowid
-            c.execute("UPDATE run SET tokens_in = tokens_in + ?, tokens_out = tokens_out + ? WHERE id = ?",
-                      (tokens_in, tokens_out, run_id))
+            c.execute(
+                "UPDATE run SET tokens_in = tokens_in + ?, tokens_out = tokens_out + ? WHERE id = ?",
+                (tokens_in, tokens_out, run_id))
             return step_id
 
     def record_tool_call(self, run_id: str, seq: int, name: str, args: dict, result: dict,
                          ok: bool, latency_ms: int, idempotency_key: str | None = None) -> int:
         with self.transaction() as c:
-            step_id = c.execute("INSERT INTO run_step (run_id, seq, kind) VALUES (?, ?, 'tool')", (run_id, seq)).lastrowid
-            c.execute("INSERT INTO tool_call (run_step_id, tool_name, args, result, ok, latency_ms, idempotency_key)"
-                      " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                      (step_id, name, json.dumps(args, default=str), json.dumps(result, default=str),
-                       int(ok), latency_ms, idempotency_key))
+            step_id = c.execute(
+                "INSERT INTO run_step (run_id, seq, kind) VALUES (?, ?, 'tool')",
+                (run_id, seq)).lastrowid
+            c.execute(
+                "INSERT INTO tool_call (run_step_id, tool_name, args, result, ok, latency_ms, idempotency_key)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (step_id, name, json.dumps(args, default=str), json.dumps(result, default=str),
+                 int(ok), latency_ms, idempotency_key))
             return step_id
 
     def load_steps(self, run_id: str) -> list[dict]:
@@ -105,7 +110,7 @@ class RunStore:
         r = self.conn.execute("SELECT * FROM run WHERE id = ?", (run_id,)).fetchone()
         return {**dict(r), "steps": self.load_steps(run_id)} if r else None
 
-    # ================================================================== Part 1: the queue (TODO)
+    # ================================================================== Part 1: the queue
 
     def enqueue(self, thread_id: str, text: str, model: str, max_attempts: int = 3) -> str:
         run_id = str(uuid.uuid4())
@@ -122,70 +127,207 @@ class RunStore:
         return run_id
 
     def claim_next(self, worker_id: str, lease_seconds: float) -> Claimed | None:
-        """TODO (Part 1.2): atomically take the oldest claimable run (status 'queued', available_at <= now,
-        oldest available_at then created_at). Set status 'running', lease_owner = worker_id,
-        lease_until = now + lease_seconds, attempts + 1, started_at if not set. Return Claimed(run_id,
-        thread_id, attempts after the increment), or None.
-        Two workers must never get the same run: find it and take it inside one BEGIN IMMEDIATE."""
-        raise NotImplementedError
+        """Atomically claim the oldest queued run."""
+        now = self.clock()
+
+        with self.transaction() as c:
+            row = c.execute(
+                "SELECT id, thread_id, attempts "
+                "FROM run "
+                "WHERE status = 'queued' AND available_at <= ? "
+                "ORDER BY available_at, created_at "
+                "LIMIT 1",
+                (now,)
+            ).fetchone()
+
+            if row is None:
+                return None
+
+            attempts = row["attempts"] + 1
+
+            c.execute(
+                f"UPDATE run SET "
+                "status = 'running', "
+                "lease_owner = ?, "
+                "lease_until = ?, "
+                "attempts = ?, "
+                f"started_at = COALESCE(started_at, {NOW_SQL}) "
+                "WHERE id = ?",
+                (worker_id, now + lease_seconds, attempts, row["id"])
+            )
+
+            return Claimed(row["id"], row["thread_id"], attempts)
 
     def heartbeat(self, run_id: str, worker_id: str, lease_seconds: float) -> bool:
-        """TODO (Part 1.3): push lease_until to now + lease_seconds, but only while the run is 'running'
-        AND leased to this worker. Return True if it was extended, False otherwise."""
-        raise NotImplementedError
+        """Extend a lease only when this worker still owns the running run."""
+        now = self.clock()
+
+        cur = self.conn.execute(
+            "UPDATE run "
+            "SET lease_until = ? "
+            "WHERE id = ? AND status = 'running' AND lease_owner = ?",
+            (now + lease_seconds, run_id, worker_id)
+        )
+
+        return cur.rowcount == 1
 
     def reap_expired(self) -> list[str]:
-        """TODO (Part 1.4): find 'running' runs whose lease_until is in the past (their worker died).
-        attempts < max_attempts: back to 'queued', available now. Otherwise: 'dead' with finished_at.
-        Either way set error_code 'lease_expired' and clear lease_owner and lease_until.
-        Return the ids touched. One transaction."""
-        raise NotImplementedError
+        """Recover runs whose worker lease has expired."""
+        now = self.clock()
+
+        with self.transaction() as c:
+            rows = c.execute(
+                "SELECT id, attempts, max_attempts "
+                "FROM run "
+                "WHERE status = 'running' AND lease_until < ?",
+                (now,)
+            ).fetchall()
+
+            touched = []
+
+            for row in rows:
+                touched.append(row["id"])
+
+                if row["attempts"] < row["max_attempts"]:
+                    c.execute(
+                        "UPDATE run SET "
+                        "status = 'queued', "
+                        "error_code = 'lease_expired', "
+                        "lease_owner = NULL, "
+                        "lease_until = NULL, "
+                        "available_at = ? "
+                        "WHERE id = ?",
+                        (now, row["id"])
+                    )
+                else:
+                    c.execute(
+                        f"UPDATE run SET "
+                        "status = 'dead', "
+                        "error_code = 'lease_expired', "
+                        "lease_owner = NULL, "
+                        "lease_until = NULL, "
+                        f"finished_at = {NOW_SQL} "
+                        "WHERE id = ?",
+                        (row["id"],)
+                    )
+
+            return touched
 
     def complete(self, run_id: str, worker_id: str, reply: str) -> bool:
         """Save the model's reply and mark the run succeeded, together, only if this worker still owns it."""
         with self.transaction() as c:
-            row = c.execute("SELECT thread_id FROM run WHERE id = ? AND status = 'running' AND lease_owner = ?",
-                            (run_id, worker_id)).fetchone()
+            row = c.execute(
+                "SELECT thread_id FROM run WHERE id = ? AND status = 'running' AND lease_owner = ?",
+                (run_id, worker_id)).fetchone()
             if row is None:
                 return False
             self.append_message(row["thread_id"], "model", reply)
-            c.execute(f"UPDATE run SET status = 'succeeded', lease_owner = NULL, lease_until = NULL,"
-                      f" error_code = NULL, finished_at = {NOW_SQL} WHERE id = ?", (run_id,))
+            c.execute(
+                f"UPDATE run SET status = 'succeeded', lease_owner = NULL, lease_until = NULL,"
+                f" error_code = NULL, finished_at = {NOW_SQL} WHERE id = ?",
+                (run_id,))
             return True
 
     # ================================================================== Lab 1: cancel
 
     def request_cancel(self, run_id: str) -> str | None:
-        """TODO (lab 1): queued -> 'cancelled' at once, with finished_at. running -> set cancel_requested = 1
-        (its worker stops after the current step). Anything else: leave it. Return the status after the
-        call, or None for an unknown run."""
-        raise NotImplementedError
+        """Cancel queued work immediately or request cancellation of running work."""
+        with self.transaction() as c:
+            row = c.execute(
+                "SELECT status FROM run WHERE id = ?",
+                (run_id,)
+            ).fetchone()
+
+            if row is None:
+                return None
+
+            status = row["status"]
+
+            if status == "queued":
+                c.execute(
+                    f"UPDATE run SET status = 'cancelled', finished_at = {NOW_SQL} WHERE id = ?",
+                    (run_id,)
+                )
+                return "cancelled"
+
+            if status == "running":
+                c.execute(
+                    "UPDATE run SET cancel_requested = 1 WHERE id = ?",
+                    (run_id,)
+                )
+                return "running"
+
+            return status
 
     def cancel_requested(self, run_id: str) -> bool:
-        return bool(self.conn.execute("SELECT cancel_requested FROM run WHERE id = ?", (run_id,)).fetchone()[0])
+        row = self.conn.execute(
+            "SELECT cancel_requested FROM run WHERE id = ?",
+            (run_id,)
+        ).fetchone()
+
+        return bool(row["cancel_requested"]) if row else False
 
     def mark_cancelled(self, run_id: str, worker_id: str) -> bool:
-        """TODO (lab 1): 'running' and leased to this worker -> 'cancelled', clear the lease, set finished_at.
-        Return True if it changed the run."""
-        raise NotImplementedError
+        """Mark a running run cancelled when owned by this worker."""
+        with self.transaction() as c:
+            cur = c.execute(
+                f"UPDATE run SET "
+                "status = 'cancelled', "
+                "lease_owner = NULL, "
+                "lease_until = NULL, "
+                f"finished_at = {NOW_SQL} "
+                "WHERE id = ? AND status = 'running' AND lease_owner = ?",
+                (run_id, worker_id)
+            )
+
+            return cur.rowcount == 1
 
     # ================================================================== Lab 2: retry and dead-letter
 
     def fail_attempt(self, run_id: str, worker_id: str, error_code: str, retryable: bool,
                      backoff_seconds: float = 2.0) -> str | None:
-        """An attempt failed. Only if this worker owns the run. Return the new status, or None.
-
-        TODO (lab 2): today every failure is final. Make it:
-          not retryable                      -> 'failed'
-          retryable, attempts < max_attempts -> 'queued', available_at = now + backoff_seconds * 2 ** (attempts - 1)
-          retryable, attempts used up        -> 'dead'
-        """
+        """Record a failed attempt and either retry or finish the run."""
         with self.transaction() as c:
-            row = c.execute("SELECT attempts FROM run WHERE id = ? AND status = 'running' AND lease_owner = ?",
-                            (run_id, worker_id)).fetchone()
+            row = c.execute(
+                "SELECT attempts, max_attempts "
+                "FROM run "
+                "WHERE id = ? AND status = 'running' AND lease_owner = ?",
+                (run_id, worker_id)
+            ).fetchone()
+
             if row is None:
                 return None
-            c.execute(f"UPDATE run SET status = 'failed', error_code = ?, lease_owner = NULL, lease_until = NULL,"
-                      f" finished_at = {NOW_SQL} WHERE id = ?", (error_code, run_id))
-            return "failed"
 
+            attempts = row["attempts"]
+            max_attempts = row["max_attempts"]
+
+            if retryable and attempts < max_attempts:
+                delay = backoff_seconds * (2 ** (attempts - 1))
+
+                c.execute(
+                    "UPDATE run SET "
+                    "status = 'queued', "
+                    "error_code = ?, "
+                    "lease_owner = NULL, "
+                    "lease_until = NULL, "
+                    "available_at = ? "
+                    "WHERE id = ?",
+                    (error_code, self.clock() + delay, run_id)
+                )
+
+                return "queued"
+
+            status = "dead" if retryable else "failed"
+
+            c.execute(
+                f"UPDATE run SET "
+                "status = ?, "
+                "error_code = ?, "
+                "lease_owner = NULL, "
+                "lease_until = NULL, "
+                f"finished_at = {NOW_SQL} "
+                "WHERE id = ?",
+                (status, error_code, run_id)
+            )
+
+            return status

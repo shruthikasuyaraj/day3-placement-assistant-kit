@@ -1,0 +1,13 @@
+ERROR:worker:run 39aacff2-d550-4689-b72a-efb03b28f5e3 crashed
+Traceback (most recent call last):
+  File "C:\Projects\day3-placement-assistant-kit\placement-assistant\app\worker.py", line 34, in run_once
+    outcome = execute_run(claimed, store=self.store, placement=self.placement, tools=self.tools,
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Projects\day3-placement-assistant-kit\placement-assistant\app\runner.py", line 155, in execute_run
+    on_step({
+  File "C:\Projects\day3-placement-assistant-kit\placement-assistant\scripts\_term.py", line 24, in print_step
+    print(f"  {colour}{seq:>2} \u2192 {name}{RESET}{DIM}({short(step['args'], 90)}){RESET}")
+  File "C:\Users\suyar\AppData\Local\Programs\Python\Python312\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2192' in position 10: character maps to <undefined>
